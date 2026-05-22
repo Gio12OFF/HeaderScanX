@@ -10,7 +10,6 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal, QPropertyAnimation, QEasingCur
 from PyQt5.QtGui import QFont, QFontDatabase, QTextCursor
 
 class ScannerThread(QThread):
-    """Поток для сканирования заголовков"""
     update_signal = pyqtSignal(str, dict, int)
     progress_signal = pyqtSignal(int)
     error_signal = pyqtSignal(str)
@@ -21,7 +20,6 @@ class ScannerThread(QThread):
         self.url = url
         
     def analyze_security_headers(self, headers):
-        """Анализ заголовков безопасности"""
         results = {
             'csp': {'status': False, 'details': '', 'risk': ''},
             'hsts': {'status': False, 'details': '', 'risk': ''},
@@ -135,7 +133,6 @@ class ScannerThread(QThread):
 
 
 class ModernButton(QPushButton):
-    """Современная кнопка с анимацией"""
     def __init__(self, text, parent=None):
         super().__init__(text, parent)
         self.setCursor(Qt.PointingHandCursor)
@@ -317,7 +314,6 @@ class HeaderScanX(QMainWindow):
         self.save_btn.clicked.connect(self.save_report)
         self.clear_btn.clicked.connect(self.clear_output)
         
-        # Изначально кнопка сохранения неактивна
         self.save_btn.setEnabled(False)
         
         input_layout.addWidget(prompt_label)
@@ -342,7 +338,7 @@ class HeaderScanX(QMainWindow):
         self.output_text.setLineWrapMode(QTextEdit.WidgetWidth)
         
         # Status bar
-        self.status_label = QLabel("🟢 SYSTEM READY • Waiting for target input")
+        self.status_label = QLabel("Made by @giooffi")
         self.status_label.setStyleSheet("""
             QLabel {
                 background: rgba(42, 111, 143, 0.2);
@@ -361,7 +357,6 @@ class HeaderScanX(QMainWindow):
         self.append_welcome()
         
     def append_welcome(self):
-        """Приветственное сообщение"""
         welcome = """
 ╔════════════════════════════════════════════════════════════════════════╗
 ║                         WELCOME TO HEADERSCANX                         ║
@@ -384,7 +379,6 @@ class HeaderScanX(QMainWindow):
         self.output_text.setText(welcome)
         
     def calculate_score(self, analysis):
-        """Расчет security score"""
         headers_status = [v['status'] for v in analysis.values()]
         total = len(headers_status)
         passed = sum(headers_status)
@@ -409,7 +403,6 @@ class HeaderScanX(QMainWindow):
         return score, rating, rating_symbol
         
     def format_results(self, url, analysis, status_code):
-        """Форматирование результатов"""
         score, rating, rating_symbol = self.calculate_score(analysis)
         
         result = f"""
@@ -425,7 +418,6 @@ class HeaderScanX(QMainWindow):
 
 """
         
-        # Заголовки с иконками
         headers_info = [
             ('Content-Security-Policy', 'csp', '🛡️'),
             ('Strict-Transport-Security', 'hsts', '🔒'),
@@ -527,12 +519,10 @@ Headers configured: {sum(1 for v in analysis.values() if v['status'])}/{len(anal
             self.status_label.setText(f"❌ Failed to save report: {str(e)}")
             
     def save_as_txt(self, file_path):
-        """Сохранение в текстовый формат"""
         with open(file_path, 'w', encoding='utf-8') as f:
             f.write(self.last_results)
             
     def save_as_json(self, file_path):
-        """Сохранение в JSON формат"""
         score, rating, _ = self.calculate_score(self.last_analysis)
         
         report_data = {
@@ -552,7 +542,6 @@ Headers configured: {sum(1 for v in analysis.values() if v['status'])}/{len(anal
             "recommendations": []
         }
         
-        # Добавляем анализ каждого заголовка
         headers_info = {
             'csp': 'Content-Security-Policy',
             'hsts': 'Strict-Transport-Security',
@@ -571,7 +560,6 @@ Headers configured: {sum(1 for v in analysis.values() if v['status'])}/{len(anal
                 "risk": data['risk'] if data['risk'] else None
             }
             
-        # Добавляем рекомендации
         if not self.last_analysis['csp']['status']:
             report_data["recommendations"].append("Implement Content-Security-Policy header to prevent XSS attacks")
         if not self.last_analysis['hsts']['status']:
@@ -587,7 +575,6 @@ Headers configured: {sum(1 for v in analysis.values() if v['status'])}/{len(anal
             json.dump(report_data, f, indent=2, ensure_ascii=False)
             
     def save_as_html(self, file_path):
-        """Сохранение в HTML формат"""
         score, rating, rating_symbol = self.calculate_score(self.last_analysis)
         
         html_content = f"""<!DOCTYPE html>
@@ -800,7 +787,6 @@ Headers configured: {sum(1 for v in analysis.values() if v['status'])}/{len(anal
             f.write(html_content)
         
     def append_to_output(self, text):
-        """Добавление текста в вывод"""
         self.output_text.append(text)
         cursor = self.output_text.textCursor()
         cursor.movePosition(QTextCursor.End)
@@ -857,7 +843,6 @@ Headers configured: {sum(1 for v in analysis.values() if v['status'])}/{len(anal
             self.status_label.setText("✅ Scan completed! Results ready - You can now save the report")
             
     def show_error(self, error_msg):
-        """Показ ошибки"""
         error_text = f"""
 {'═'*90}
 ⚠️ SCAN ERROR
@@ -878,7 +863,6 @@ Possible solutions:
         self.save_btn.setEnabled(False)
         
     def scan_finished(self):
-        """Завершение сканирования"""
         self.scan_btn.setEnabled(True)
         self.progress.setVisible(False)
         if self.progress.value() != 100:
