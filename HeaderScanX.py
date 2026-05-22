@@ -2,23 +2,86 @@ import sys
 import requests
 import re
 import json
+import time
+import urllib.parse
 from datetime import datetime
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                             QHBoxLayout, QLabel, QLineEdit, QPushButton, 
-                            QTextEdit, QProgressBar, QGroupBox, QFrame, QFileDialog, QMessageBox)
+                            QTextEdit, QProgressBar, QGroupBox, QFrame, 
+                            QFileDialog, QMessageBox, QCheckBox)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QPropertyAnimation, QEasingCurve, QRect
 from PyQt5.QtGui import QFont, QFontDatabase, QTextCursor
 
+VT_API_KEY = "965d9e6358ee0adbb2dd8c0b405dfa8cb5763e1313732282630a57894ea5a405"
+
+class VirusTotalScanner:
+    def __init__(self, api_key):
+        self.api_key = api_key
+        self.base_url = "https://www.virustotal.com/api/v3"
+        self.headers = {
+            "x-apikey": self.api_key,
+            "Accept": "application/json"
+        }
+    
+    def check_url_safety(self, url):
+        try:
+            # Отправляем URL на сканирование
+            scan_url = f"{self.base_url}/urls"
+            data = {"url": url}
+            
+            response = requests.post(scan_url, headers=self.headers, data=data)
+            
+            if response.status_code == 200:
+                scan_data = response.json()
+                url_id = scan_data.get("data", {}).get("id", "")
+                
+                if url_id:
+                    # Ждём завершения анализа
+                    time.sleep(5)
+                    
+                    # Получаем результат
+                    report_url = f"{self.base_url}/analyses/{url_id}"
+                    response = requests.get(report_url, headers=self.headers)
+                    
+                    if response.status_code == 200:
+                        report_data = response.json()
+                        attributes = report_data.get("data", {}).get("attributes", {})
+                        stats = attributes.get("stats", {})
+                        
+                        malicious = stats.get("malicious", 0)
+                        suspicious = stats.get("suspicious", 0)
+                        
+                        return {
+                            "success": True,
+                            "url": url,
+                            "malicious": malicious,
+                            "suspicious": suspicious,
+                            "harmless": stats.get("harmless", 0),
+                            "undetected": stats.get("undetected", 0),
+                            "total_scans": sum(stats.values()),
+                            "reputation": 0,
+                            "is_safe": malicious == 0 and suspicious == 0
+                        }
+            
+            return {"error": "Не удалось получить результат от VirusTotal. Попробуйте позже."}
+            
+        except requests.exceptions.RequestException as e:
+            return {"error": f"Ошибка сети: {str(e)}"}
+        except Exception as e:
+            return {"error": f"Ошибка: {str(e)}"}
+
 class ScannerThread(QThread):
     update_signal = pyqtSignal(str, dict, int)
+    vt_signal = pyqtSignal(dict)
     progress_signal = pyqtSignal(int)
     error_signal = pyqtSignal(str)
     finished_signal = pyqtSignal()
     
-    def __init__(self, url):
+    def __init__(self, url, vt_enabled):
         super().__init__()
         self.url = url
-        
+        self.vt_enabled = vt_enabled
+    
     def analyze_security_headers(self, headers):
         results = {
             'csp': {'status': False, 'details': '', 'risk': ''},
@@ -30,7 +93,6 @@ class ScannerThread(QThread):
             'pp': {'status': False, 'details': '', 'risk': ''}
         }
         
-        # Content-Security-Policy
         csp = headers.get('Content-Security-Policy', headers.get('Content-Security-Policy-Report-Only', ''))
         if csp:
             results['csp']['status'] = True
@@ -48,7 +110,6 @@ class ScannerThread(QThread):
             results['csp']['risk'] = "❌ Высокий риск XSS-атак"
             results['csp']['details'] = "Отсутствует защита от межсайтового скриптинга"
         
-        # HSTS
         hsts = headers.get('Strict-Transport-Security', '')
         if hsts:
             results['hsts']['status'] = True
@@ -62,7 +123,6 @@ class ScannerThread(QThread):
             results['hsts']['risk'] = "❌ Риск SSL stripping атак"
             results['hsts']['details'] = "Отсутствует принудительное HTTPS соединение"
         
-        # X-Frame-Options
         xfo = headers.get('X-Frame-Options', '')
         if xfo:
             results['xfo']['status'] = True
@@ -72,7 +132,6 @@ class ScannerThread(QThread):
             results['xfo']['risk'] = "❌ Риск кликджекинга"
             results['xfo']['details'] = "Сайт может быть встроен в frame/frame"
         
-        # X-XSS-Protection
         xss = headers.get('X-XSS-Protection', '')
         if xss:
             results['xss']['status'] = True
@@ -81,7 +140,6 @@ class ScannerThread(QThread):
             results['xss']['risk'] = "⚠️ Средний риск"
             results['xss']['details'] = "Старый браузерный XSS фильтр отключен"
         
-        # X-Content-Type-Options
         xcto = headers.get('X-Content-Type-Options', '')
         if xcto and xcto.lower() == 'nosniff':
             results['xcto']['status'] = True
@@ -90,7 +148,6 @@ class ScannerThread(QThread):
             results['xcto']['risk'] = "⚠️ Риск MIME-атак"
             results['xcto']['details'] = "Браузер может определять MIME-типы автоматически"
         
-        # Referrer-Policy
         rp = headers.get('Referrer-Policy', '')
         if rp:
             results['rp']['status'] = True
@@ -99,7 +156,6 @@ class ScannerThread(QThread):
             results['rp']['risk'] = "⚠️ Утечка referrer информации"
             results['rp']['details'] = "Рекомендуется strict-origin-when-cross-origin"
         
-        # Permissions-Policy
         pp = headers.get('Permissions-Policy', '')
         if pp:
             results['pp']['status'] = True
@@ -120,9 +176,16 @@ class ScannerThread(QThread):
             
             headers_dict = response.headers
             analysis = self.analyze_security_headers(headers_dict)
-            self.progress_signal.emit(90)
+            self.progress_signal.emit(70)
             
             self.update_signal.emit(self.url, analysis, response.status_code)
+            
+            if self.vt_enabled and VT_API_KEY:
+                self.progress_signal.emit(75)
+                vt_scanner = VirusTotalScanner(VT_API_KEY)
+                vt_results = vt_scanner.check_url_safety(self.url)
+                self.vt_signal.emit(vt_results)
+            
             self.progress_signal.emit(100)
             
         except requests.exceptions.RequestException as e:
@@ -130,7 +193,6 @@ class ScannerThread(QThread):
             self.progress_signal.emit(0)
         finally:
             self.finished_signal.emit()
-
 
 class ModernButton(QPushButton):
     def __init__(self, text, parent=None):
@@ -157,23 +219,21 @@ class ModernButton(QPushButton):
         anim.setEndValue(new_geom)
         anim.start()
 
-
 class HeaderScanX(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("HeaderScanX v2.0 - Advanced Security Header Scanner")
-        self.setGeometry(100, 100, 1300, 850)
+        self.setWindowTitle("HeaderScanX v3.0 - Advanced Security Scanner with VirusTotal")
+        self.setGeometry(100, 100, 1400, 900)
         
-        # Хранение последних результатов
         self.last_results = None
         self.last_url = None
         self.last_analysis = None
         self.last_status_code = None
+        self.last_vt_results = None
+        self.results_ready = False
         
-        # Настройка шрифтов
         font_family = "Courier New"
         
-        # Градиентный фон
         self.setStyleSheet(f"""
             QMainWindow {{
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
@@ -255,6 +315,11 @@ class HeaderScanX(QMainWindow):
                 padding: 0 10px;
                 color: #4af0ff;
             }}
+            QCheckBox {{
+                color: #a0f0ff;
+                font-family: '{font_family}', monospace;
+                font-size: 12px;
+            }}
         """)
         
         central_widget = QWidget()
@@ -263,7 +328,6 @@ class HeaderScanX(QMainWindow):
         main_layout.setSpacing(15)
         main_layout.setContentsMargins(20, 20, 20, 20)
         
-        # Header с ASCII
         header_frame = QFrame()
         header_frame.setStyleSheet("""
             QFrame {
@@ -276,28 +340,27 @@ class HeaderScanX(QMainWindow):
         header_layout = QVBoxLayout(header_frame)
         
         ascii_title = QLabel("""
-╔══════════════════════════════════════════════════════════════════════════════╗
+╔═══════════════════════════════════════════════════════════════════════════════════════════╗
 ║  ██╗  ██╗███████╗ █████╗ ██████╗ ███████╗██████╗ ███████╗ ██████╗  █████╗ ███╗   ██╗██╗  ██╗
 ║  ██║  ██║██╔════╝██╔══██╗██╔══██╗██╔════╝██╔══██╗██╔════╝██╔════╝ ██╔══██╗████╗  ██║╚██╗██╔╝
 ║  ███████║█████╗  ███████║██║  ██║█████╗  ██████╔╝███████╗██║  ███╗███████║██╔██╗ ██║ ╚███╔╝ 
 ║  ██╔══██║██╔══╝  ██╔══██║██║  ██║██╔══╝  ██╔══██╗╚════██║██║   ██║██╔══██║██║╚██╗██║ ██╔██╗ 
 ║  ██║  ██║███████╗██║  ██║██████╔╝███████╗██║  ██║███████║╚██████╔╝██║  ██║██║ ╚████║██╔╝ ██╗
 ║  ╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝╚═════╝ ╚══════╝╚═╝  ╚═╝╚══════╝ ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═══╝╚═╝  ╚═╝
-║                                                                                          ║
-║                     Сделано для защиты проетка                                           ║
-╚══════════════════════════════════════════════════════════════════════════════════════════╝
+║                                                                                           ║
+║                    Advanced Security Header Scanner v3.0 with VirusTotal                  ║
+╚═══════════════════════════════════════════════════════════════════════════════════════════╝
         """)
-        ascii_title.setFont(QFont("Courier New", 9))
+        ascii_title.setFont(QFont("Courier New", 8))
         ascii_title.setAlignment(Qt.AlignCenter)
         header_layout.addWidget(ascii_title)
         
         main_layout.addWidget(header_frame)
         
-        # Input section
         input_group = QGroupBox("🎯 TARGET ACQUISITION")
-        input_layout = QHBoxLayout()
-        input_layout.setSpacing(15)
+        input_layout = QVBoxLayout()
         
+        url_layout = QHBoxLayout()
         prompt_label = QLabel("⟫")
         prompt_label.setFont(QFont(font_family, 18, QFont.Bold))
         prompt_label.setStyleSheet("color: #4af0ff;")
@@ -316,20 +379,28 @@ class HeaderScanX(QMainWindow):
         
         self.save_btn.setEnabled(False)
         
-        input_layout.addWidget(prompt_label)
-        input_layout.addWidget(self.url_input)
-        input_layout.addWidget(self.scan_btn)
-        input_layout.addWidget(self.save_btn)
-        input_layout.addWidget(self.clear_btn)
+        url_layout.addWidget(prompt_label)
+        url_layout.addWidget(self.url_input)
+        url_layout.addWidget(self.scan_btn)
+        url_layout.addWidget(self.save_btn)
+        url_layout.addWidget(self.clear_btn)
+        
+        vt_layout = QHBoxLayout()
+        self.vt_checkbox = QCheckBox("🔍 Включить проверку VirusTotal (репутация URL)")
+        self.vt_checkbox.setChecked(True)
+        
+        vt_layout.addWidget(self.vt_checkbox)
+        vt_layout.addStretch()
+        
+        input_layout.addLayout(url_layout)
+        input_layout.addLayout(vt_layout)
         input_group.setLayout(input_layout)
         main_layout.addWidget(input_group)
         
-        # Progress bar
         self.progress = QProgressBar()
         self.progress.setVisible(False)
         main_layout.addWidget(self.progress)
         
-        # Output area
         output_group = QGroupBox("📊 SCAN RESULTS")
         output_layout = QVBoxLayout()
         
@@ -337,8 +408,7 @@ class HeaderScanX(QMainWindow):
         self.output_text.setReadOnly(True)
         self.output_text.setLineWrapMode(QTextEdit.WidgetWidth)
         
-        # Status bar
-        self.status_label = QLabel("Made by @giooffi")
+        self.status_label = QLabel("🟢 SYSTEM READY • Waiting for target input")
         self.status_label.setStyleSheet("""
             QLabel {
                 background: rgba(42, 111, 143, 0.2);
@@ -353,36 +423,39 @@ class HeaderScanX(QMainWindow):
         output_group.setLayout(output_layout)
         main_layout.addWidget(output_group)
         
-        # Initial welcome message
         self.append_welcome()
-        
+    
     def append_welcome(self):
         welcome = """
-╔════════════════════════════════════════════════════════════════════════╗
-║                         WELCOME TO HEADERSCANX                         ║
-╠════════════════════════════════════════════════════════════════════════╣
-║  • Advanced security header analysis for web applications             ║
-║  • Real-time vulnerability assessment                                 ║
-║  • Comprehensive security scoring system                              ║
-║  • Detailed recommendations for improvement                           ║
-╠════════════════════════════════════════════════════════════════════════╣
-║  HOW TO USE:                                                          ║
-║  1. Enter target URL (http:// or https://)                           ║
-║  2. Click "SCAN TARGET" or press ENTER                               ║
-║  3. Analyze the security report                                      ║
-║  4. Click "SAVE REPORT" to export results (TXT, JSON, or HTML)       ║
-╠════════════════════════════════════════════════════════════════════════╣
-║  EXAMPLE: https://google.com | https://github.com | https://cloudflare.com
-╚════════════════════════════════════════════════════════════════════════╝
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                         WELCOME TO HEADERSCANX v3.0                          ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  • Advanced security header analysis for web applications                   ║
+║  • Real-time vulnerability assessment                                       ║
+║  • Comprehensive security scoring system                                    ║
+║  • VirusTotal integration for URL reputation check                          ║
+║  • Detailed recommendations for improvement                                 ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  HOW TO USE:                                                                ║
+║  1. Enter target URL (http:// or https://)                                 ║
+║  2. Enable/disable VirusTotal check (optional)                             ║
+║  3. Click "SCAN TARGET" or press ENTER                                     ║
+║  4. Analyze the security report                                            ║
+║  5. Click "SAVE REPORT" to export results (TXT, JSON, or HTML)             ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  EXAMPLE: https://google.com | https://github.com | https://cloudflare.com ║
+╚══════════════════════════════════════════════════════════════════════════════╝
 
 """
         self.output_text.setText(welcome)
-        
+    
     def calculate_score(self, analysis):
+        if analysis is None:
+            return 0, "UNKNOWN", "❓"
         headers_status = [v['status'] for v in analysis.values()]
         total = len(headers_status)
         passed = sum(headers_status)
-        score = int((passed / total) * 100)
+        score = int((passed / total) * 100) if total > 0 else 0
         
         if score >= 90:
             rating = "EXCELLENT"
@@ -399,16 +472,16 @@ class HeaderScanX(QMainWindow):
         else:
             rating = "CRITICAL"
             rating_symbol = "❌"
-            
-        return score, rating, rating_symbol
         
-    def format_results(self, url, analysis, status_code):
+        return score, rating, rating_symbol
+    
+    def format_results(self, url, analysis, status_code, vt_results=None):
         score, rating, rating_symbol = self.calculate_score(analysis)
         
         result = f"""
-{'═'*90}
+{'═'*95}
 📡 SCAN REPORT • {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-{'═'*90}
+{'═'*95}
 
 ┌─ TARGET INFORMATION
 │  URL: {url}
@@ -428,71 +501,104 @@ class HeaderScanX(QMainWindow):
             ('Permissions-Policy', 'pp', '🎯')
         ]
         
-        for display_name, key, icon in headers_info:
-            data = analysis[key]
-            if data['status']:
-                status_icon = "✅"
-                status_text = "CONFIGURED"
-            else:
-                status_icon = "❌"
-                status_text = "MISSING"
-            
-            result += f"""
+        if analysis:
+            for display_name, key, icon in headers_info:
+                data = analysis.get(key, {})
+                if data.get('status', False):
+                    status_icon = "✅"
+                    status_text = "CONFIGURED"
+                else:
+                    status_icon = "❌"
+                    status_text = "MISSING"
+                
+                result += f"""
 ┌─ {icon} {display_name}
 │  Status: {status_icon} {status_text}
-│  Analysis: {data['details']}"""
-            
-            if data['risk']:
-                result += f"""
+│  Analysis: {data.get('details', 'Нет данных')}"""
+                
+                if data.get('risk'):
+                    result += f"""
 │  Risk: {data['risk']}"""
+        else:
+            result += "\n│  ⚠️ Нет данных об анализа заголовков\n"
+        
+        if vt_results and vt_results.get('success'):
+            status_icon = "✅" if vt_results['is_safe'] else "❌"
+            status_text = "БЕЗОПАСНО" if vt_results['is_safe'] else "ОПАСНО"
+            
+            result += f"""
+
+{'═'*95}
+🔍 VIRUSTOTAL АНАЛИЗ РЕПУТАЦИИ
+{'═'*95}
+
+┌─ Статус: {status_icon} {status_text}
+│  Вредоносные детекты: {vt_results['malicious']}
+│  Подозрительные: {vt_results['suspicious']}
+│  Безвредные: {vt_results['harmless']}
+│  Не обнаружено: {vt_results['undetected']}
+│  Всего проверок: {vt_results['total_scans']}
+│  Рейтинг репутации: {vt_results['reputation']}
+"""
+        elif vt_results and vt_results.get('error'):
+            result += f"""
+
+{'═'*95}
+🔍 VIRUSTOTAL АНАЛИЗ
+{'═'*95}
+
+┌─ ⚠️ Ошибка: {vt_results['error']}
+"""
         
         result += f"""
 
-{'═'*90}
+{'═'*95}
 📊 SECURITY SCORE
-{'═'*90}
+{'═'*95}
 
 Score: {score}/100
 Rating: {rating_symbol} {rating}
 
-Headers configured: {sum(1 for v in analysis.values() if v['status'])}/{len(analysis)}
+Headers configured: {sum(1 for v in analysis.values() if v['status']) if analysis else 0}/{len(analysis) if analysis else 7}
 
-{'═'*90}
+{'═'*95}
 💡 RECOMMENDATIONS
-{'═'*90}"""
+{'═'*95}"""
         
-        # Рекомендации
         recommendations_added = False
-        if not analysis['csp']['status']:
-            result += "\n  • Implement Content-Security-Policy header to prevent XSS attacks"
-            recommendations_added = True
-        if not analysis['hsts']['status']:
-            result += "\n  • Enable HSTS with max-age=31536000 and includeSubDomains"
-            recommendations_added = True
-        if not analysis['xfo']['status']:
-            result += "\n  • Add X-Frame-Options: DENY to prevent clickjacking"
-            recommendations_added = True
-        if not analysis['xcto']['status']:
-            result += "\n  • Set X-Content-Type-Options: nosniff"
-            recommendations_added = True
-        if not analysis['rp']['status']:
-            result += "\n  • Configure Referrer-Policy: strict-origin-when-cross-origin"
+        if analysis:
+            if not analysis.get('csp', {}).get('status', False):
+                result += "\n  • Implement Content-Security-Policy header to prevent XSS attacks"
+                recommendations_added = True
+            if not analysis.get('hsts', {}).get('status', False):
+                result += "\n  • Enable HSTS with max-age=31536000 and includeSubDomains"
+                recommendations_added = True
+            if not analysis.get('xfo', {}).get('status', False):
+                result += "\n  • Add X-Frame-Options: DENY to prevent clickjacking"
+                recommendations_added = True
+            if not analysis.get('xcto', {}).get('status', False):
+                result += "\n  • Set X-Content-Type-Options: nosniff"
+                recommendations_added = True
+            if not analysis.get('rp', {}).get('status', False):
+                result += "\n  • Configure Referrer-Policy: strict-origin-when-cross-origin"
+                recommendations_added = True
+        
+        if vt_results and vt_results.get('success') and not vt_results['is_safe']:
+            result += "\n  • ⚠️ ВНИМАНИЕ: VirusTotal обнаружил угрозы! Проверьте сайт на вредоносное ПО"
             recommendations_added = True
             
         if not recommendations_added:
             result += "\n  ✓ All critical security headers are properly configured!"
-            
-        result += "\n\n" + "═"*90 + "\n"
+        
+        result += "\n\n" + "═"*95 + "\n"
         
         return result
-        
+    
     def save_report(self):
-        """Сохранение отчёта в файл"""
         if not self.last_results:
             QMessageBox.warning(self, "No Data", "No scan results to save. Please run a scan first.")
             return
-            
-        # Диалог выбора формата и места сохранения
+        
         file_path, selected_filter = QFileDialog.getSaveFileName(
             self,
             "Save Security Report",
@@ -502,26 +608,22 @@ Headers configured: {sum(1 for v in analysis.values() if v['status'])}/{len(anal
         
         if not file_path:
             return
-            
+        
         try:
             if selected_filter == "Text Files (*.txt)":
-                self.save_as_txt(file_path)
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write(self.last_results)
             elif selected_filter == "JSON Files (*.json)":
                 self.save_as_json(file_path)
             elif selected_filter == "HTML Files (*.html)":
                 self.save_as_html(file_path)
-                
+            
             QMessageBox.information(self, "Success", f"Report saved successfully to:\n{file_path}")
             self.status_label.setText(f"💾 Report saved to {file_path}")
-            
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to save report:\n{str(e)}")
             self.status_label.setText(f"❌ Failed to save report: {str(e)}")
-            
-    def save_as_txt(self, file_path):
-        with open(file_path, 'w', encoding='utf-8') as f:
-            f.write(self.last_results)
-            
+    
     def save_as_json(self, file_path):
         score, rating, _ = self.calculate_score(self.last_analysis)
         
@@ -530,15 +632,16 @@ Headers configured: {sum(1 for v in analysis.values() if v['status'])}/{len(anal
                 "url": self.last_url,
                 "status_code": self.last_status_code,
                 "scan_time": datetime.now().isoformat(),
-                "scanner_version": "HeaderScanX v2.0"
+                "scanner_version": "HeaderScanX v3.0"
             },
             "security_score": {
                 "score": score,
                 "rating": rating,
-                "total_headers": len(self.last_analysis),
-                "configured_headers": sum(1 for v in self.last_analysis.values() if v['status'])
+                "total_headers": len(self.last_analysis) if self.last_analysis else 7,
+                "configured_headers": sum(1 for v in self.last_analysis.values() if v['status']) if self.last_analysis else 0
             },
             "headers_analysis": {},
+            "virustotal": self.last_vt_results if hasattr(self, 'last_vt_results') else None,
             "recommendations": []
         }
         
@@ -552,30 +655,50 @@ Headers configured: {sum(1 for v in analysis.values() if v['status'])}/{len(anal
             'pp': 'Permissions-Policy'
         }
         
-        for key, display_name in headers_info.items():
-            data = self.last_analysis[key]
-            report_data["headers_analysis"][display_name] = {
-                "present": data['status'],
-                "details": data['details'],
-                "risk": data['risk'] if data['risk'] else None
-            }
-            
-        if not self.last_analysis['csp']['status']:
-            report_data["recommendations"].append("Implement Content-Security-Policy header to prevent XSS attacks")
-        if not self.last_analysis['hsts']['status']:
-            report_data["recommendations"].append("Enable HSTS with max-age=31536000 and includeSubDomains")
-        if not self.last_analysis['xfo']['status']:
-            report_data["recommendations"].append("Add X-Frame-Options: DENY to prevent clickjacking")
-        if not self.last_analysis['xcto']['status']:
-            report_data["recommendations"].append("Set X-Content-Type-Options: nosniff")
-        if not self.last_analysis['rp']['status']:
-            report_data["recommendations"].append("Configure Referrer-Policy: strict-origin-when-cross-origin")
-            
+        if self.last_analysis:
+            for key, display_name in headers_info.items():
+                data = self.last_analysis.get(key, {})
+                report_data["headers_analysis"][display_name] = {
+                    "present": data.get('status', False),
+                    "details": data.get('details', ''),
+                    "risk": data.get('risk') if data.get('risk') else None
+                }
+        
+        if self.last_analysis:
+            if not self.last_analysis.get('csp', {}).get('status', False):
+                report_data["recommendations"].append("Implement Content-Security-Policy header to prevent XSS attacks")
+            if not self.last_analysis.get('hsts', {}).get('status', False):
+                report_data["recommendations"].append("Enable HSTS with max-age=31536000 and includeSubDomains")
+            if not self.last_analysis.get('xfo', {}).get('status', False):
+                report_data["recommendations"].append("Add X-Frame-Options: DENY to prevent clickjacking")
+            if not self.last_analysis.get('xcto', {}).get('status', False):
+                report_data["recommendations"].append("Set X-Content-Type-Options: nosniff")
+            if not self.last_analysis.get('rp', {}).get('status', False):
+                report_data["recommendations"].append("Configure Referrer-Policy: strict-origin-when-cross-origin")
+        
         with open(file_path, 'w', encoding='utf-8') as f:
             json.dump(report_data, f, indent=2, ensure_ascii=False)
-            
+    
     def save_as_html(self, file_path):
         score, rating, rating_symbol = self.calculate_score(self.last_analysis)
+        
+        vt_html = ""
+        if self.last_vt_results and self.last_vt_results.get('success'):
+            vt_status_color = "#7fff7f" if self.last_vt_results['is_safe'] else "#ff6b6b"
+            vt_status_text = "SAFE" if self.last_vt_results['is_safe'] else "MALICIOUS"
+            vt_html = f"""
+        <div class="section">
+            <div class="section-title">🔍 VirusTotal Analysis</div>
+            <div class="header-item">
+                <strong>Status:</strong> <span style="color: {vt_status_color};">{vt_status_text}</span><br>
+                <strong>Malicious:</strong> {self.last_vt_results['malicious']}<br>
+                <strong>Suspicious:</strong> {self.last_vt_results['suspicious']}<br>
+                <strong>Harmless:</strong> {self.last_vt_results['harmless']}<br>
+                <strong>Undetected:</strong> {self.last_vt_results['undetected']}<br>
+                <strong>Total Scans:</strong> {self.last_vt_results['total_scans']}<br>
+                <strong>Reputation:</strong> {self.last_vt_results['reputation']}
+            </div>
+        </div>"""
         
         html_content = f"""<!DOCTYPE html>
 <html lang="en">
@@ -584,13 +707,9 @@ Headers configured: {sum(1 for v in analysis.values() if v['status'])}/{len(anal
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Security Report - {self.last_url}</title>
     <style>
-        * {{
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }}
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
         body {{
-            font-family: 'Courier New', 'Monaco', monospace;
+            font-family: 'Courier New', monospace;
             background: linear-gradient(135deg, #0a0e27 0%, #1a1f3a 100%);
             color: #a0f0ff;
             padding: 20px;
@@ -604,19 +723,7 @@ Headers configured: {sum(1 for v in analysis.values() if v['status'])}/{len(anal
             padding: 30px;
             border: 1px solid #2a6f8f;
         }}
-        h1 {{
-            color: #4af0ff;
-            text-align: center;
-            margin-bottom: 30px;
-            font-size: 28px;
-            text-shadow: 0 0 10px rgba(74, 240, 255, 0.5);
-        }}
-        .header {{
-            text-align: center;
-            margin-bottom: 30px;
-            padding-bottom: 20px;
-            border-bottom: 2px solid #2a6f8f;
-        }}
+        h1 {{ color: #4af0ff; text-align: center; margin-bottom: 30px; }}
         .section {{
             margin-bottom: 30px;
             padding: 20px;
@@ -624,55 +731,24 @@ Headers configured: {sum(1 for v in analysis.values() if v['status'])}/{len(anal
             border-radius: 10px;
             border-left: 3px solid #4af0ff;
         }}
-        .section-title {{
-            color: #4af0ff;
-            font-size: 20px;
-            margin-bottom: 15px;
-            font-weight: bold;
-        }}
+        .section-title {{ color: #4af0ff; font-size: 20px; margin-bottom: 15px; }}
         .header-item {{
             margin-bottom: 15px;
             padding: 10px;
             background: rgba(0, 0, 0, 0.3);
             border-radius: 5px;
         }}
-        .status-configured {{
-            color: #7fff7f;
-        }}
-        .status-missing {{
-            color: #ff6b6b;
-        }}
-        .risk-high {{
-            color: #ff6b6b;
-        }}
-        .risk-medium {{
-            color: #ffa07a;
-        }}
-        .score {{
-            font-size: 48px;
-            font-weight: bold;
-            text-align: center;
-            margin: 20px 0;
-        }}
-        .rating {{
-            text-align: center;
-            font-size: 24px;
-            margin-bottom: 20px;
-        }}
+        .status-configured {{ color: #7fff7f; }}
+        .status-missing {{ color: #ff6b6b; }}
+        .score {{ font-size: 48px; font-weight: bold; text-align: center; margin: 20px 0; }}
+        .rating {{ text-align: center; font-size: 24px; margin-bottom: 20px; }}
         .recommendation {{
             padding: 10px;
             margin: 10px 0;
             background: rgba(255, 100, 100, 0.1);
             border-left: 3px solid #ff6b6b;
         }}
-        .footer {{
-            text-align: center;
-            margin-top: 30px;
-            padding-top: 20px;
-            border-top: 1px solid #2a6f8f;
-            font-size: 12px;
-            color: #6a8faf;
-        }}
+        .footer {{ text-align: center; margin-top: 30px; padding-top: 20px; border-top: 1px solid #2a6f8f; }}
         .badge {{
             display: inline-block;
             padding: 3px 8px;
@@ -680,23 +756,13 @@ Headers configured: {sum(1 for v in analysis.values() if v['status'])}/{len(anal
             font-size: 11px;
             margin-left: 10px;
         }}
-        .badge-success {{
-            background: rgba(127, 255, 127, 0.2);
-            color: #7fff7f;
-        }}
-        .badge-danger {{
-            background: rgba(255, 107, 107, 0.2);
-            color: #ff6b6b;
-        }}
+        .badge-success {{ background: rgba(127, 255, 127, 0.2); color: #7fff7f; }}
+        .badge-danger {{ background: rgba(255, 107, 107, 0.2); color: #ff6b6b; }}
     </style>
 </head>
 <body>
     <div class="container">
-        <div class="header">
-            <h1>🔒 HeaderScanX Security Report</h1>
-            <p>Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
-            <p>Scanner Version: 2.0</p>
-        </div>
+        <h1>🔒 HeaderScanX Security Report</h1>
         
         <div class="section">
             <div class="section-title">🎯 Target Information</div>
@@ -711,14 +777,11 @@ Headers configured: {sum(1 for v in analysis.values() if v['status'])}/{len(anal
             <div class="section-title">📊 Security Score</div>
             <div class="score">{score}/100</div>
             <div class="rating">{rating_symbol} {rating}</div>
-            <div class="header-item">
-                Headers Configured: {sum(1 for v in self.last_analysis.values() if v['status'])}/{len(self.last_analysis)}
-            </div>
         </div>
         
         <div class="section">
             <div class="section-title">🛡️ Security Headers Analysis</div>"""
-            
+        
         headers_info = [
             ('Content-Security-Policy', 'csp', '🛡️'),
             ('Strict-Transport-Security', 'hsts', '🔒'),
@@ -729,55 +792,55 @@ Headers configured: {sum(1 for v in analysis.values() if v['status'])}/{len(anal
             ('Permissions-Policy', 'pp', '🎯')
         ]
         
-        for display_name, key, icon in headers_info:
-            data = self.last_analysis[key]
-            status_class = "status-configured" if data['status'] else "status-missing"
-            status_text = "CONFIGURED" if data['status'] else "MISSING"
-            badge_class = "badge-success" if data['status'] else "badge-danger"
-            
-            html_content += f"""
+        if self.last_analysis:
+            for display_name, key, icon in headers_info:
+                data = self.last_analysis.get(key, {})
+                status_class = "status-configured" if data.get('status', False) else "status-missing"
+                status_text = "CONFIGURED" if data.get('status', False) else "MISSING"
+                badge_class = "badge-success" if data.get('status', False) else "badge-danger"
+                
+                html_content += f"""
             <div class="header-item">
                 <strong>{icon} {display_name}</strong> <span class="badge {badge_class}">{status_text}</span><br>
-                <span class="{status_class}">Analysis:</span> {data['details']}<br>"""
-            
-            if data['risk']:
-                risk_class = "risk-high" if "❌" in data['risk'] else "risk-medium"
-                html_content += f"""<span class="{risk_class}">Risk:</span> {data['risk']}<br>"""
+                <span class="{status_class}">Analysis:</span> {data.get('details', 'Нет данных')}<br>"""
                 
-            html_content += """</div>"""
-            
-        html_content += """
+                if data.get('risk'):
+                    html_content += f"""<span>Risk:</span> {data['risk']}<br>"""
+                
+                html_content += """</div>"""
+        
+        html_content += vt_html + """
         </div>
         
         <div class="section">
             <div class="section-title">💡 Recommendations</div>"""
         
         recommendations_added = False
-        if not self.last_analysis['csp']['status']:
-            html_content += '<div class="recommendation">• Implement Content-Security-Policy header to prevent XSS attacks</div>'
-            recommendations_added = True
-        if not self.last_analysis['hsts']['status']:
-            html_content += '<div class="recommendation">• Enable HSTS with max-age=31536000 and includeSubDomains</div>'
-            recommendations_added = True
-        if not self.last_analysis['xfo']['status']:
-            html_content += '<div class="recommendation">• Add X-Frame-Options: DENY to prevent clickjacking</div>'
-            recommendations_added = True
-        if not self.last_analysis['xcto']['status']:
-            html_content += '<div class="recommendation">• Set X-Content-Type-Options: nosniff</div>'
-            recommendations_added = True
-        if not self.last_analysis['rp']['status']:
-            html_content += '<div class="recommendation">• Configure Referrer-Policy: strict-origin-when-cross-origin</div>'
-            recommendations_added = True
-            
+        if self.last_analysis:
+            if not self.last_analysis.get('csp', {}).get('status', False):
+                html_content += '<div class="recommendation">• Implement Content-Security-Policy header</div>'
+                recommendations_added = True
+            if not self.last_analysis.get('hsts', {}).get('status', False):
+                html_content += '<div class="recommendation">• Enable HSTS with max-age=31536000</div>'
+                recommendations_added = True
+            if not self.last_analysis.get('xfo', {}).get('status', False):
+                html_content += '<div class="recommendation">• Add X-Frame-Options: DENY</div>'
+                recommendations_added = True
+            if not self.last_analysis.get('xcto', {}).get('status', False):
+                html_content += '<div class="recommendation">• Set X-Content-Type-Options: nosniff</div>'
+                recommendations_added = True
+            if not self.last_analysis.get('rp', {}).get('status', False):
+                html_content += '<div class="recommendation">• Configure Referrer-Policy</div>'
+                recommendations_added = True
+        
         if not recommendations_added:
-            html_content += '<div class="recommendation" style="background: rgba(127, 255, 127, 0.1); border-left-color: #7fff7f;">✓ All critical security headers are properly configured!</div>'
-            
+            html_content += '<div class="recommendation" style="background: rgba(127, 255, 127, 0.1); border-left-color: #7fff7f;">✓ All headers configured!</div>'
+        
         html_content += """
         </div>
         
         <div class="footer">
-            <p>Generated by HeaderScanX v2.0 - Advanced Security Header Scanner</p>
-            <p>This report is for informational purposes only</p>
+            <p>Generated by HeaderScanX v3.0</p>
         </div>
     </div>
 </body>
@@ -785,68 +848,81 @@ Headers configured: {sum(1 for v in analysis.values() if v['status'])}/{len(anal
         
         with open(file_path, 'w', encoding='utf-8') as f:
             f.write(html_content)
-        
+    
     def append_to_output(self, text):
         self.output_text.append(text)
         cursor = self.output_text.textCursor()
         cursor.movePosition(QTextCursor.End)
         self.output_text.setTextCursor(cursor)
-        
+    
     def clear_output(self):
-        """Очистка вывода"""
         self.output_text.clear()
         self.append_welcome()
         self.status_label.setText("🗑️ Output cleared • Ready for new scan")
         self.save_btn.setEnabled(False)
         self.last_results = None
-        
+    
     def start_scan(self):
-        """Запуск сканирования"""
         url = self.url_input.text().strip()
         if not url:
             self.status_label.setText("⚠️ Please enter a target URL")
             return
-            
+        
         if not url.startswith(('http://', 'https://')):
             url = 'https://' + url
             self.url_input.setText(url)
-            
+        
+        vt_enabled = self.vt_checkbox.isChecked()
+        
         self.output_text.clear()
         self.append_to_output(f"\n🔄 Initializing security scan for: {url}\n{'─'*70}\n")
+        if vt_enabled:
+            self.append_to_output("🔍 VirusTotal reputation check ENABLED\n")
         self.status_label.setText(f"🔍 Scanning {url}...")
         self.scan_btn.setEnabled(False)
         self.save_btn.setEnabled(False)
         self.progress.setVisible(True)
         self.progress.setValue(0)
         
-        # Запуск потока сканирования
-        self.scanner_thread = ScannerThread(url)
+        self.scanner_thread = ScannerThread(url, vt_enabled)
         self.scanner_thread.update_signal.connect(self.update_output)
+        self.scanner_thread.vt_signal.connect(self.update_vt_results)
         self.scanner_thread.progress_signal.connect(self.update_progress)
         self.scanner_thread.error_signal.connect(self.show_error)
         self.scanner_thread.finished_signal.connect(self.scan_finished)
         self.scanner_thread.start()
-        
+    
     def update_output(self, url, analysis, status_code):
-        """Обновление вывода"""
         self.last_url = url
         self.last_analysis = analysis
         self.last_status_code = status_code
-        self.last_results = self.format_results(url, analysis, status_code)
-        self.append_to_output(self.last_results)
-        self.save_btn.setEnabled(True)
-        
+        self.update_complete_report()
+    
+    def update_vt_results(self, vt_results):
+        self.last_vt_results = vt_results
+        self.update_complete_report()
+    
+    def update_complete_report(self):
+        if self.last_analysis is not None:
+            self.last_results = self.format_results(
+                self.last_url, 
+                self.last_analysis, 
+                self.last_status_code, 
+                self.last_vt_results
+            )
+            self.append_to_output(self.last_results)
+            self.save_btn.setEnabled(True)
+    
     def update_progress(self, value):
-        """Обновление прогресса"""
         self.progress.setValue(value)
         if value == 100:
             self.status_label.setText("✅ Scan completed! Results ready - You can now save the report")
-            
+    
     def show_error(self, error_msg):
         error_text = f"""
-{'═'*90}
+{'═'*95}
 ⚠️ SCAN ERROR
-{'═'*90}
+{'═'*95}
 
 Error: {error_msg}
 
@@ -856,19 +932,18 @@ Possible solutions:
 • Ensure the website is online
 • Check your internet connection
 
-{'═'*90}
+{'═'*95}
 """
         self.append_to_output(error_text)
         self.status_label.setText(f"❌ Scan failed: {error_msg}")
         self.save_btn.setEnabled(False)
-        
+    
     def scan_finished(self):
         self.scan_btn.setEnabled(True)
         self.progress.setVisible(False)
         if self.progress.value() != 100:
             self.status_label.setText("⚠️ Scan interrupted • Ready for retry")
             self.save_btn.setEnabled(False)
-
 
 def main():
     app = QApplication(sys.argv)
@@ -877,7 +952,6 @@ def main():
     window = HeaderScanX()
     window.show()
     sys.exit(app.exec_())
-
 
 if __name__ == "__main__":
     main()
