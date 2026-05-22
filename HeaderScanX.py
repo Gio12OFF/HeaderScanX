@@ -25,7 +25,7 @@ class VirusTotalScanner:
     
     def check_url_safety(self, url):
         try:
-            # Отправляем URL на сканирование
+            # Отправление URL на сканирование
             scan_url = f"{self.base_url}/urls"
             data = {"url": url}
             
@@ -36,7 +36,7 @@ class VirusTotalScanner:
                 url_id = scan_data.get("data", {}).get("id", "")
                 
                 if url_id:
-                    # Ждём завершения анализа
+                    # ожидание завершения анализа
                     time.sleep(5)
                     
                     # Получаем результат
